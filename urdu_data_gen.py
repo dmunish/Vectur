@@ -1,168 +1,192 @@
 import numpy as np
 import cv2
 import networkx as nx
+import json
+import imageio
+import os
 from PIL import Image, ImageDraw, ImageFont
 from arabic_reshaper import reshape
 from bidi.algorithm import get_display
 from skimage.morphology import skeletonize
-import imageio
 import matplotlib.pyplot as plt
 
 class UrduHandwritingGenerator:
-    def __init__(self, font_path, font_size=100):
+    def __init__(self, font_path, font_size=100, sampling_rate=0.2, speed_scale=5.0):
         self.font = ImageFont.truetype(font_path, font_size)
         self.font_size = font_size
+        self.sampling_rate = sampling_rate  # Time interval between points
+        self.speed_scale = speed_scale      # Global multiplier for spacing
+
+    def _distort_mask(self, mask):
+        """Adds wavy edges and elastic distortions to the text mask."""
+        rows, cols = mask.shape
+        # Create a mesh grid for displacement
+        map_x, map_y = np.meshgrid(np.arange(cols), np.arange(rows))
+        
+        # 1. Add low-frequency waves (Sine waves)
+        map_x = map_x + 2.0 * np.sin(map_y / 10.0)
+        map_y = map_y + 1.5 * np.cos(map_x / 15.0)
+        
+        # 2. Add high-frequency jitter (Hand tremble)
+        noise = np.random.normal(0, 0.3, (rows, cols))
+        map_x = (map_x + noise).astype(np.float32)
+        map_y = (map_y + noise).astype(np.float32)
+
+        distorted = cv2.remap(mask.astype(np.float32), map_x, map_y, cv2.INTER_LINEAR)
+        return distorted.astype(np.uint8)
 
     def _text_to_mask(self, text):
-        """Renders Urdu text to a high-res binary mask."""
-        # 1. Handle Urdu RTL and Ligatures
         reshaped_text = reshape(text)
         bidi_text = get_display(reshaped_text)
         
-        # 2. Create canvas
         dummy_img = Image.new('L', (1, 1))
         draw = ImageDraw.Draw(dummy_img)
-        w, h = draw.textbbox((0, 0), bidi_text, font=self.font)[2:]
+        bbox = draw.textbbox((0, 0), bidi_text, font=self.font)
+        w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         
-        img = Image.new('L', (w + 40, h + 40), 0)
+        img = Image.new('L', (w + 100, h + 100), 0)
         draw = ImageDraw.Draw(img)
-        draw.text((20, 20), bidi_text, font=self.font, fill=255)
-        return np.array(img)
+        draw.text((50, 50), bidi_text, font=self.font, fill=255)
+        
+        mask = np.array(img)
+        return self._distort_mask(mask)
 
     def generate_handwriting_sim(self, mask):
-        """Creates a distorted, noisy PNG simulation of handwriting."""
-        # Skewing / Affine Transform
+        """Dark ink against noisy paper."""
         rows, cols = mask.shape
-        pts1 = np.float32([[5, 5], [cols - 5, 5], [5, rows - 5]])
-        pts2 = np.float32([[0, 10], [cols, 0], [10, rows]])
+        # Skewing
+        pts1 = np.float32([[10, 10], [cols-10, 10], [10, rows-10]])
+        pts2 = np.float32([[15, 20], [cols-5, 5], [5, rows-5]])
         M = cv2.getAffineTransform(pts1, pts2)
         distorted = cv2.warpAffine(mask, M, (cols, rows))
 
-        # Add Noise and Background
-        bg = np.random.normal(240, 5, (rows, cols)).astype(np.uint8)
+        bg = np.random.normal(242, 4, (rows, cols)).astype(np.uint8)
         text_indices = distorted > 127
-        bg[text_indices] = np.random.randint(40, 80, size=np.sum(text_indices))
-        
-        # Ink bleed effect
-        bg = cv2.GaussianBlur(bg, (3, 3), 0)
-        return bg
+        bg[text_indices] = np.random.randint(45, 75, size=np.sum(text_indices))
+        return cv2.GaussianBlur(bg, (3, 3), 0)
 
     def get_motion_vectors(self, mask):
-        """Extracts the spine and generates time-encoded vectors."""
-        # 1. Skeletonize to get 1-pixel spine
         skeleton = skeletonize(mask > 127).astype(np.uint8)
-        
-        # 2. Convert pixels to Graph
         nodes = np.argwhere(skeleton > 0)
         G = nx.Graph()
         for r, c in nodes:
             G.add_node((r, c))
-            # Check 8-neighbors to build edges
             for dr in [-1, 0, 1]:
                 for dc in [-1, 0, 1]:
                     if dr == 0 and dc == 0: continue
                     if (r + dr, c + dc) in G:
                         G.add_edge((r, c), (r + dr, c + dc))
 
-        # 3. Traversal Logic
         components = sorted(nx.connected_components(G), key=len, reverse=True)
-        all_vectors = [] # List of (x, y, t)
-        current_time = 0.0
+        all_vectors = []
+        global_time = 0.0
 
-        for i, comp in enumerate(components):
+        for comp in components:
             subgraph = G.subgraph(comp)
-            # Start: Topmost-Rightmost (Min Y, Max X)
             start_node = min(comp, key=lambda n: (n[0], -n[1]))
+            pixel_path = self._right_preference_dfs(subgraph, start_node)
             
-            # DFS Traversal with "Right-first" preference
-            path = self._right_preference_dfs(subgraph, start_node)
-            
-            # 4. Kinematics (Sigma-Lognormal / Power Law)
-            vectors, end_time = self._apply_kinematics(path, current_time)
-            all_vectors.append(vectors)
-            current_time = end_time + 0.5 # Pen-lift delay
+            # Resample based on kinematic speed
+            resampled_stroke, end_time = self._resample_path(pixel_path, global_time)
+            all_vectors.append(resampled_stroke)
+            global_time = end_time + 1.0 # Lift pause
             
         return all_vectors
 
     def _right_preference_dfs(self, G, start_node):
-        path = []
-        visited = set()
+        path, visited = [], set()
         stack = [start_node]
-        
         while stack:
             u = stack.pop()
             if u not in visited:
                 visited.add(u)
                 path.append(u)
-                # Sort neighbors: preferring right (higher column index)
                 neighbors = sorted(G.neighbors(u), key=lambda n: n[1], reverse=True)
                 for v in neighbors:
-                    if v not in visited:
-                        stack.append(v)
+                    if v not in visited: stack.append(v)
         return path
 
-    def _apply_kinematics(self, path, start_time):
-        """Calculates timestamps using a curvature-velocity power law."""
-        vectors = []
-        t = start_time
-        for i in range(len(path)):
-            if i == 0:
-                vectors.append((path[i][1], path[i][0], t))
-                continue
-            
-            # Dead simple curvature approximation: 
-            # Speed is constant for this MVP, but hook for Power Law:
-            # v = k * (curvature)**-1/3
-            # Here we use a distance-based dt for simplicity
-            dist = np.linalg.norm(np.array(path[i]) - np.array(path[i-1]))
-            dt = dist * 0.05 # Adjust for "speed"
-            t += dt
-            vectors.append((path[i][1], path[i][0], t))
-            
-        return np.array(vectors), t
+    def _resample_path(self, path, start_time):
+        """
+        Samples points at constant time intervals. 
+        Distance between points = speed * dt.
+        """
+        path = np.array(path)
+        if len(path) < 2: 
+            return np.array([[path[0][1], path[0][0], start_time]]), start_time
 
-    def save_visualizations(self, text, handwriting_img, vectors, filename_prefix):
-        # 1. Save Handwriting Simulation
-        cv2.imwrite(f"{filename_prefix}_handwriting.png", handwriting_img)
+        # Calculate cumulative distance along pixels
+        diffs = np.diff(path, axis=0)
+        dists = np.sqrt(np.sum(diffs**2, axis=1))
+        cum_dist = np.concatenate(([0], np.cumsum(dists)))
         
-        # 2. Save Vector Plot (Color = Time)
-        plt.figure(figsize=(10, 4))
+        # Kinematic Speed Profile: Slow down at curves (approx)
+        # For simplicity: higher local curvature = lower speed
+        total_len = cum_dist[-1]
+        
+        # Create a temporal mapping: we want to sample at fixed 'self.sampling_rate'
+        # Points further apart = higher velocity
+        # New T array representing uniform clock ticks
+        num_samples = int(total_len / self.speed_scale)
+        if num_samples < 2: num_samples = 2
+        
+        # Interpolate X and Y coordinates based on the speed-weighted distance
+        # To make speed controllable, we adjust the number of points taken over the length
+        interp_dists = np.linspace(0, total_len, num_samples)
+        
+        new_x = np.interp(interp_dists, cum_dist, path[:, 1])
+        new_y = np.interp(interp_dists, cum_dist, path[:, 0])
+        times = start_time + np.arange(num_samples) * self.sampling_rate
+        
+        return np.column_stack((new_x, new_y, times)), times[-1]
+
+    def save_visualizations(self, text, handwriting_img, vectors, prefix):
+        # 1. Save Simulation
+        cv2.imwrite(f"{prefix}_handwriting.png", handwriting_img)
+        
+        # 2. Vector Plot (Numbering instead of colors, No axes)
+        fig, ax = plt.subplots(figsize=(12, 5))
+        point_count = 0
+        
         for stroke in vectors:
-            plt.scatter(stroke[:, 0], -stroke[:, 1], c=stroke[:, 2], cmap='viridis', s=2)
-        plt.axis('equal')
-        plt.title(f"Motion Vectors for: {text}")
-        plt.savefig(f"{filename_prefix}_vectors.png")
+            ax.plot(stroke[:, 0], -stroke[:, 1], 'o', markersize=2, color='black', alpha=0.6)
+            
+            # Add numbering every 10 points
+            for i in range(0, len(stroke), 10):
+                ax.text(stroke[i, 0]+1, -stroke[i, 1]+1, str(point_count + i), 
+                        fontsize=6, color='red', alpha=0.8)
+            point_count += len(stroke)
+
+        ax.set_aspect('equal')
+        ax.axis('off') # Requirement 1: No axes
+        plt.tight_layout()
+        plt.savefig(f"{prefix}_vectors.png", bbox_inches='tight', pad_inches=0)
         plt.close()
 
-        # 3. Generate GIF
+        # 3. GIF Generation
         frames = []
-        full_path = np.vstack(vectors)
-        for i in range(0, len(full_path), 5): # Step by 5 for speed
-            fig, ax = plt.subplots()
-            ax.scatter(full_path[:i, 0], -full_path[:i, 1], c='black', s=1)
-            ax.set_xlim(np.min(full_path[:,0])-10, np.max(full_path[:,0])+10)
-            ax.set_ylim(-np.max(full_path[:,1])-10, -np.min(full_path[:,1])+10)
+        all_pts = np.vstack(vectors)
+        for i in range(2, len(all_pts), max(1, len(all_pts)//40)):
+            fig, ax = plt.subplots(figsize=(6, 2))
+            ax.scatter(all_pts[:i, 0], -all_pts[:i, 1], c='black', s=2)
+            ax.set_xlim(np.min(all_pts[:,0])-20, np.max(all_pts[:,0])+20)
+            ax.set_ylim(-np.max(all_pts[:,1])-20, -np.min(all_pts[:,1])+20)
+            ax.axis('off')
             fig.canvas.draw()
-            image = np.frombuffer(fig.canvas.tostring_argb(), dtype='uint8')
-            image = image.reshape(fig.canvas.get_width_height()[::-1] + (3,))
-            frames.append(image)
+            image = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
+            image = image.reshape(fig.canvas.get_width_height()[::-1] + (4,))
+            frames.append(cv2.cvtColor(image, cv2.COLOR_RGBA2RGB))
             plt.close()
-        imageio.mimsave(f"{filename_prefix}_order.gif", frames, fps=10)
+        imageio.mimsave(f"{prefix}_order.gif", frames, fps=10)
 
-# --- High Level Module ---
-def process_urdu_file(file_path, font_path):
-    gen = UrduHandwritingGenerator(font_path)
-    
-    with open(file_path, 'r', encoding='utf-8') as f:
-        lines = [line.strip() for line in f if line.strip()]
-        
-    for idx, line in enumerate(lines):
-        print(f"Processing line {idx+1}: {line}")
-        mask = gen._text_to_mask(line)
-        hw_img = gen.generate_handwriting_sim(mask)
-        vectors = gen.get_motion_vectors(mask)
-        gen.save_visualizations(line, hw_img, vectors, f"output_line_{idx}")
+def main():
+    # Usage
+    gen = UrduHandwritingGenerator("NotoSansArabic-ExtraLight.ttf", speed_scale=8.0)
+    word = "کتاب"
+    mask = gen._text_to_mask(word)
+    hw = gen.generate_handwriting_sim(mask)
+    vecs = gen.get_motion_vectors(mask)
+    gen.save_visualizations(word, hw, vecs, "output_sample")
 
 if __name__ == "__main__":
-    # Ensure you have the font file in the directory
-    process_urdu_file("urdu_text.txt", "NotoSansArabic-ExtraLight.ttf")
+    main()
