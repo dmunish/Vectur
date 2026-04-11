@@ -11,11 +11,12 @@ from skimage.morphology import skeletonize
 import matplotlib.pyplot as plt
 
 class UrduHandwritingGenerator:
-    def __init__(self, font_path, font_size=100, sampling_rate=0.2, speed_scale=5.0):
+    def __init__(self, font_path, font_size=100, sampling_rate=0.2, speed_scale=5.0, dpi=300):
         self.font = ImageFont.truetype(font_path, font_size)
         self.font_size = font_size
         self.sampling_rate = sampling_rate  # Time interval between points
         self.speed_scale = speed_scale      # Global multiplier for spacing
+        self.dpi = dpi                      # Resolution for output plots
 
     def _distort_mask(self, mask):
         """Adds wavy edges and elastic distortions to the text mask."""
@@ -66,7 +67,12 @@ class UrduHandwritingGenerator:
         return cv2.GaussianBlur(bg, (3, 3), 0)
 
     def get_motion_vectors(self, mask):
-        skeleton = skeletonize(mask > 127).astype(np.uint8)
+        # Bridge small gaps to connect disconnected curves that belong together
+        binary_mask = (mask > 127).astype(np.uint8)
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+        closed_mask = cv2.morphologyEx(binary_mask, cv2.MORPH_CLOSE, kernel)
+        
+        skeleton = skeletonize(closed_mask > 0).astype(np.uint8)
         nodes = np.argwhere(skeleton > 0)
         G = nx.Graph()
         for r, c in nodes:
@@ -77,13 +83,15 @@ class UrduHandwritingGenerator:
                     if (r + dr, c + dc) in G:
                         G.add_edge((r, c), (r + dr, c + dc))
 
-        components = sorted(nx.connected_components(G), key=len, reverse=True)
+        # Sort components from Right to Left explicitly
+        components = sorted(nx.connected_components(G), key=lambda c: max(n[1] for n in c), reverse=True)
         all_vectors = []
         global_time = 0.0
 
         for comp in components:
             subgraph = G.subgraph(comp)
-            start_node = min(comp, key=lambda n: (n[0], -n[1]))
+            # Find top-right-most node (minimize -col to maximize rightness, then minimize row for top)
+            start_node = min(comp, key=lambda n: (-n[1], n[0]))
             pixel_path = self._right_preference_dfs(subgraph, start_node)
             
             # Resample based on kinematic speed
@@ -145,22 +153,22 @@ class UrduHandwritingGenerator:
         cv2.imwrite(f"{prefix}_handwriting.png", handwriting_img)
         
         # 2. Vector Plot (Numbering instead of colors, No axes)
-        fig, ax = plt.subplots(figsize=(12, 5))
+        fig, ax = plt.subplots(figsize=(12, 5), dpi=self.dpi)
         point_count = 0
         
         for stroke in vectors:
             ax.plot(stroke[:, 0], -stroke[:, 1], 'o', markersize=2, color='black', alpha=0.6)
             
-            # Add numbering every 10 points
-            for i in range(0, len(stroke), 10):
-                ax.text(stroke[i, 0]+1, -stroke[i, 1]+1, str(point_count + i), 
-                        fontsize=6, color='red', alpha=0.8)
+            # Add numbering to each point
+            for i in range(len(stroke)):
+                ax.text(stroke[i, 0]+0.5, -stroke[i, 1]+0.5, str(point_count + i), 
+                        fontsize=4, color='red', alpha=0.8)
             point_count += len(stroke)
 
         ax.set_aspect('equal')
         ax.axis('off') # Requirement 1: No axes
         plt.tight_layout()
-        plt.savefig(f"{prefix}_vectors.png", bbox_inches='tight', pad_inches=0)
+        plt.savefig(f"{prefix}_vectors.png", bbox_inches='tight', pad_inches=0, dpi=self.dpi)
         plt.close()
 
         # 3. GIF Generation
