@@ -251,7 +251,7 @@ class UrduHandwritingGenerator:
         plt.savefig(f"{prefix}_vectors.png", bbox_inches='tight', pad_inches=0, dpi=self.dpi)
         plt.close()
 
-        # 3. GIF Generation
+        # 3. MP4 Video Generation
         frames = []
         all_pts = np.vstack(vectors)
         for i in range(2, len(all_pts), max(1, len(all_pts)//40)):
@@ -263,14 +263,21 @@ class UrduHandwritingGenerator:
             fig.canvas.draw()
             image = np.frombuffer(fig.canvas.buffer_rgba(), dtype='uint8')
             image = image.reshape(fig.canvas.get_width_height()[::-1] + (4,))
-            frames.append(cv2.cvtColor(image, cv2.COLOR_RGBA2RGB))
+            frames.append(cv2.cvtColor(image, cv2.COLOR_RGBA2BGR))
             plt.close()
-        imageio.mimsave(f"{prefix}_order.gif", frames, fps=10)
+            
+        if frames:
+            height, width, layers = frames[0].shape
+            fourcc = cv2.VideoWriter_fourcc(*'mp4v')
+            video = cv2.VideoWriter(f"{prefix}_order.mp4", fourcc, 24, (width, height))
+            for frame in frames:
+                video.write(frame)
+            video.release()
 
 def main():
     # Usage
     gen = UrduHandwritingGenerator("NotoSansArabic-ExtraLight.ttf", speed_scale=8.0)
-    word = "دانش"
+    word = "کتاب"
     mask = gen._text_to_mask(word)
     hw = gen.generate_handwriting_sim(mask)
     vecs = gen.get_motion_vectors(mask)
