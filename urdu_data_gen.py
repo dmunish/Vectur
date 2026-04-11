@@ -229,18 +229,21 @@ class UrduHandwritingGenerator:
         # 1. Save Simulation
         cv2.imwrite(f"{prefix}_handwriting.png", handwriting_img)
         
-        # 2. Vector Plot (Numbering instead of colors, No axes)
+        # 2. Vector Plot (Gradient colors instead of numbering, No axes)
         fig, ax = plt.subplots(figsize=(12, 5), dpi=self.dpi)
-        point_count = 0
         
-        for stroke in vectors:
-            ax.plot(stroke[:, 0], -stroke[:, 1], 'o', markersize=2, color='black', alpha=0.6)
+        if vectors:
+            all_vec_pts = np.vstack(vectors)
+            total_points = len(all_vec_pts)
             
-            # Add numbering to each point
-            for i in range(len(stroke)):
-                ax.text(stroke[i, 0]+0.5, -stroke[i, 1]+0.5, str(point_count + i), 
-                        fontsize=4, color='red', alpha=0.8)
-            point_count += len(stroke)
+            # Create a gradient from Red to Blue (R=1->0, B=0->1)
+            colors = np.zeros((total_points, 4))
+            colors[:, 0] = np.linspace(1, 0, total_points)  # Red
+            colors[:, 2] = np.linspace(0, 1, total_points)  # Blue
+            colors[:, 3] = 0.8                              # Alpha
+            
+            # Scatter plot with larger dots (s=20) and gradient colors
+            ax.scatter(all_vec_pts[:, 0], -all_vec_pts[:, 1], c=colors, s=30, edgecolors='none')
 
         ax.set_aspect('equal')
         ax.axis('off') # Requirement 1: No axes
