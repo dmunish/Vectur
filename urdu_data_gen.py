@@ -43,11 +43,16 @@ class UrduHandwritingGenerator:
         dummy_img = Image.new('L', (1, 1))
         draw = ImageDraw.Draw(dummy_img)
         bbox = draw.textbbox((0, 0), bidi_text, font=self.font)
+        # Calculate actual width and height
         w, h = bbox[2] - bbox[0], bbox[3] - bbox[1]
         
-        img = Image.new('L', (w + 100, h + 100), 0)
+        # Add generous padding to avoid cut-offs from text descenders, skew, or wavy distortions
+        pad = 100
+        img = Image.new('L', (w + 2*pad, h + 2*pad), 0)
         draw = ImageDraw.Draw(img)
-        draw.text((50, 50), bidi_text, font=self.font, fill=255)
+        
+        # Shift the drawing strictly by the bounding box offset to center it properly
+        draw.text((pad - bbox[0], pad - bbox[1]), bidi_text, font=self.font, fill=255)
         
         mask = np.array(img)
         return self._distort_mask(mask)
@@ -90,63 +95,138 @@ class UrduHandwritingGenerator:
 
         for comp in components:
             subgraph = G.subgraph(comp)
-            # Find top-right-most node (minimize -col to maximize rightness, then minimize row for top)
-            start_node = min(comp, key=lambda n: (-n[1], n[0]))
-            pixel_path = self._right_preference_dfs(subgraph, start_node)
+            # Find top-right-most node (balance top-to-bottom and right-to-left)
+            start_node = min(comp, key=lambda n: n[0] - n[1])
             
-            # Resample based on kinematic speed
-            resampled_stroke, end_time = self._resample_path(pixel_path, global_time)
-            all_vectors.append(resampled_stroke)
-            global_time = end_time + 1.0 # Lift pause
+            # Extract continuous paths to prevent unnatural straight-line jumps across the component
+            strokes = self._extract_continuous_strokes(subgraph, start_node)
+            
+            for pixel_path in strokes:
+                # Resample based on kinematic speed
+                resampled_stroke, end_time = self._resample_path(pixel_path, global_time)
+                if len(resampled_stroke) > 0:
+                    all_vectors.append(resampled_stroke)
+                global_time = end_time + 0.5 # Lift pause between strokes
+            
+            global_time += 1.0 # Extra lift pause between components
             
         return all_vectors
 
-    def _right_preference_dfs(self, G, start_node):
-        path, visited = [], set()
-        stack = [start_node]
-        while stack:
-            u = stack.pop()
-            if u not in visited:
-                visited.add(u)
-                path.append(u)
-                neighbors = sorted(G.neighbors(u), key=lambda n: n[1], reverse=True)
-                for v in neighbors:
-                    if v not in visited: stack.append(v)
-        return path
+    def _extract_continuous_strokes(self, G, start_node):
+        strokes = []
+        visited = set()
+        
+        def trace_stroke(start):
+            stroke = [start]
+            visited.add(start)
+            curr = start
+            while True:
+                unvisited_neighbors = [n for n in G.neighbors(curr) if n not in visited]
+                if not unvisited_neighbors:
+                    break
+                # Right-preference: pick the unvisited neighbor furthest to the right
+                next_node = sorted(unvisited_neighbors, key=lambda n: n[1], reverse=True)[0]
+                stroke.append(next_node)
+                visited.add(next_node)
+                curr = next_node
+            return stroke
+
+        # Start the first stroke at the specified start node
+        strokes.append(trace_stroke(start_node))
+        
+        # Continue starting new strokes for any branches we missed, preserving the graph topology
+        unvisited_nodes = set(G.nodes) - visited
+        while unvisited_nodes:
+            # Prefer starting at a node adj to an already visited node to minimize leap distance
+            next_start = None
+            for n in unvisited_nodes:
+                if any(nbr in visited for nbr in G.neighbors(n)):
+                    next_start = n
+                    break
+            
+            if next_start is None:
+                # Disjoint sub-graph scenario (failsafe)
+                next_start = min(unvisited_nodes, key=lambda n: n[0] - n[1])
+                
+            strokes.append(trace_stroke(next_start))
+            unvisited_nodes = set(G.nodes) - visited
+            
+        return strokes
 
     def _resample_path(self, path, start_time):
         """
         Samples points at constant time intervals. 
-        Distance between points = speed * dt.
+        Implements the Two-Thirds Power Law for realistic kinematic speed:
+        Velocity is proportional to the radius of curvature to the 1/3 power.
         """
-        path = np.array(path)
-        if len(path) < 2: 
-            return np.array([[path[0][1], path[0][0], start_time]]), start_time
+        path = np.array(path, dtype=np.float32)
+        
+        if len(path) == 0:
+            return np.empty((0, 3)), start_time
+        if len(path) < 5: 
+            # Too short to compute reliable curvature; assume constant speed
+            times = start_time + np.arange(len(path)) * self.sampling_rate
+            return np.column_stack((path[:, 1], path[:, 0], times)), times[-1]
 
-        # Calculate cumulative distance along pixels
-        diffs = np.diff(path, axis=0)
-        dists = np.sqrt(np.sum(diffs**2, axis=1))
-        cum_dist = np.concatenate(([0], np.cumsum(dists)))
+        # 1. Smooth coordinate trajectory to compute stable derivatives
+        window = min(15, len(path))
+        kernel = np.ones(window) / window
+        x_pad = np.pad(path[:, 1], (window//2, window//2), mode='edge')
+        y_pad = np.pad(path[:, 0], (window//2, window//2), mode='edge')
+        x_s = np.convolve(x_pad, kernel, mode='valid')
+        y_s = np.convolve(y_pad, kernel, mode='valid')
         
-        # Kinematic Speed Profile: Slow down at curves (approx)
-        # For simplicity: higher local curvature = lower speed
-        total_len = cum_dist[-1]
+        # Equalize length after convolution
+        min_len = min(len(path), len(x_s))
+        x_s = x_s[:min_len]
+        y_s = y_s[:min_len]
         
-        # Create a temporal mapping: we want to sample at fixed 'self.sampling_rate'
-        # Points further apart = higher velocity
-        # New T array representing uniform clock ticks
-        num_samples = int(total_len / self.speed_scale)
-        if num_samples < 2: num_samples = 2
+        # 2. First and Second Derivatives
+        dx = np.gradient(x_s)
+        dy = np.gradient(y_s)
+        ddx = np.gradient(dx)
+        ddy = np.gradient(dy)
         
-        # Interpolate X and Y coordinates based on the speed-weighted distance
-        # To make speed controllable, we adjust the number of points taken over the length
-        interp_dists = np.linspace(0, total_len, num_samples)
+        # 3. Compute Curvature k = |x'y'' - y'x''| / (x'^2 + y'^2)^(3/2)
+        speed_sq = dx**2 + dy**2
+        speed_sq[speed_sq < 1e-5] = 1e-5 # prevent division by zero
+        k = np.abs(dx * ddy - dy * ddx) / (speed_sq**(1.5))
         
-        new_x = np.interp(interp_dists, cum_dist, path[:, 1])
-        new_y = np.interp(interp_dists, cum_dist, path[:, 0])
-        times = start_time + np.arange(num_samples) * self.sampling_rate
+        # 4. Two-Thirds Power Law: Velocity v ~ (k + e)^(-1/3)
+        # We add epsilon to k to clip maximum straight-line speed
+        epsilon = 0.005
+        v = (k + epsilon)**(-1/3)
         
-        return np.column_stack((new_x, new_y, times)), times[-1]
+        # Scale generic velocity contour up by user-defined speed_scale
+        v = v * self.speed_scale
+        
+        # 5. Map spatial distance to time
+        pts = np.column_stack((x_s, y_s))
+        diffs = np.diff(pts, axis=0)
+        ds = np.sqrt(np.sum(diffs**2, axis=1)) # length is min_len - 1
+        
+        # Average velocity for each segment
+        v_segment = (v[:-1] + v[1:]) / 2.0
+        
+        dt = ds / v_segment
+        dt = np.clip(dt, 1e-4, np.inf) # minimal viable time diff
+        
+        cum_time = np.concatenate(([0], np.cumsum(dt))) # length is min_len
+        total_time = cum_time[-1]
+        
+        # 6. Interpolate points at constant sampling rate
+        num_samples = int(total_time / self.sampling_rate)
+        if num_samples < 2: 
+            num_samples = 2
+            
+        target_times = np.linspace(0, total_time, num_samples)
+        
+        # Interpolate against original unsmoothed points to preserve sharp corners
+        new_x = np.interp(target_times, cum_time, path[:min_len, 1])
+        new_y = np.interp(target_times, cum_time, path[:min_len, 0])
+        final_times = start_time + target_times
+        
+        return np.column_stack((new_x, new_y, final_times)), final_times[-1]
 
     def save_visualizations(self, text, handwriting_img, vectors, prefix):
         # 1. Save Simulation
@@ -190,7 +270,7 @@ class UrduHandwritingGenerator:
 def main():
     # Usage
     gen = UrduHandwritingGenerator("NotoSansArabic-ExtraLight.ttf", speed_scale=8.0)
-    word = "کتاب"
+    word = "دانش"
     mask = gen._text_to_mask(word)
     hw = gen.generate_handwriting_sim(mask)
     vecs = gen.get_motion_vectors(mask)
