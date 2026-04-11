@@ -1,9 +1,6 @@
 import numpy as np
 import cv2
 import networkx as nx
-import json
-import imageio
-import os
 from PIL import Image, ImageDraw, ImageFont
 from arabic_reshaper import reshape
 from bidi.algorithm import get_display
