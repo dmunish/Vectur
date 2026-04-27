@@ -276,8 +276,8 @@ class UrduHandwritingGenerator:
 
 def main():
     # Usage
-    gen = UrduHandwritingGenerator("NotoSansArabic-ExtraLight.ttf", speed_scale=8.0)
-    word = "کتاب"
+    gen = UrduHandwritingGenerator("Fonts\\NotoSansArabic-Regular.ttf", speed_scale=8.0)
+    word = "الف"
     mask = gen._text_to_mask(word)
     hw = gen.generate_handwriting_sim(mask)
     vecs = gen.get_motion_vectors(mask)
